@@ -1,0 +1,132 @@
+# PROMOTED from Spike 007 feasibility-test/deploy-solution.yml (Phase 18, plan 18-02, D-15).
+# Covers tests T4 (dispatch + correlation), T7 (happy-path import + binding),
+# T8 (SP-bind of SA-owned connection), T11 (environment approval gate).
+#
+# To run T4/T11 WITHOUT a tenant: this file already lives in a repo's .github/workflows/;
+# set the two `secrets` to dummies, comment the pac steps, keep the echo + approval jobs.
+# To run T7/T8: supply real PP_* secrets and a scratch source->target env pair.
+#
+# SUPPLY CHAIN (T-18-05): every `uses:` below is PINNED to a 40-hex commit SHA; the tag
+# it resolved to is in the trailing comment. See README.md for the action -> tag -> SHA
+# table and how to re-resolve. Do not revert to a bare `@vN` tag.
+
+name: deploy-solution
+run-name: deploy-${{ github.event.client_payload.correlationId }}   # T4: correlate the 204-no-run-id dispatch
+
+on:
+  repository_dispatch:
+    types: [deploy-solution]      # app fires this via the certified GitHub connector
+
+# client_payload shape the app sends (bindings nested under ONE property -> any size, <64KB):
+# {
+#   "correlationId": "oss-deploy-8f3c…",
+#   "sourceSolution": "PlatformHub",
+#   "sourceEnvUrl":   "https://dev.crm.dynamics.com",
+#   "targetEnvUrl":   "https://qa.crm.dynamics.com",
+#   "appBuiltFromSha":"<git sha the running app was built from>",   # T-risk: commit drift
+#   "bindings": [
+#     { "LogicalName": "oss_sharedsql_abc12", "ConnectionId": "0f1e2d…", "ConnectorId": "/providers/Microsoft.PowerApps/apis/shared_sql" }
+#   ]
+# }
+
+permissions:
+  contents: read
+
+jobs:
+  # ── T4: prove the trigger + correlation WITHOUT a tenant ────────────────────
+  echo-payload:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Show what the app sent
+        run: |
+          echo "correlationId = ${{ github.event.client_payload.correlationId }}"
+          echo "target        = ${{ github.event.client_payload.targetEnvUrl }}"
+          echo "bindings (raw JSON):"
+          echo '${{ toJSON(github.event.client_payload.bindings) }}'
+          test -n "${{ github.event.client_payload.correlationId }}" || (echo "::error::no correlationId" && exit 1)
+
+  build-artifact:
+    needs: echo-payload
+    runs-on: ubuntu-latest       # Linux: forward-slash zip entry names (required by the zip-patch)
+    steps:
+      - name: Checkout the EXACT commit the app was built from   # T-risk: commit drift (value→label maps)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4
+        with:
+          ref: ${{ github.event.client_payload.appBuiltFromSha }}
+
+      - name: Install Power Platform tools
+        uses: microsoft/powerplatform-actions/actions-install@0e44beb5424af932af47250a2568eba4c259e3d8   # v1
+
+      - name: Export (unmanaged) from SOURCE
+        uses: microsoft/powerplatform-actions/export-solution@0e44beb5424af932af47250a2568eba4c259e3d8   # v1
+        with:
+          environment-url: ${{ github.event.client_payload.sourceEnvUrl }}
+          app-id:        ${{ secrets.PP_APP_ID }}
+          client-secret: ${{ secrets.PP_CLIENT_SECRET }}
+          tenant-id:     ${{ secrets.PP_TENANT_ID }}
+          solution-name: ${{ github.event.client_payload.sourceSolution }}
+          managed: false
+          solution-output-file: out/${{ github.event.client_payload.sourceSolution }}.zip
+
+      # ── DEFERRED CODE-REVIEW HOOK #1 (record only, NOT now): Solution Checker on the RAW export ──
+      # - uses: microsoft/powerplatform-actions/check-solution@0e44beb5424af932af47250a2568eba4c259e3d8   # v1
+      #   with: { path: out/${{ github.event.client_payload.sourceSolution }}.zip, ... }
+
+      - name: ⚠ MANDATORY zip-patch (optionset export poisoning 0x8009050c)
+        shell: pwsh
+        run: |
+          # export -> PATCH -> import. The proven, PARAMETERIZED port script (Phase 18 T9 / D-14 —
+          # byte-identical + idempotent, promoted to ./scripts/author-missing-columns.ps1 here)
+          # extracts the exported solution zip, authors the dropped optionset/bit columns from
+          # src/generated/models/*Model.ts, and re-zips (forward-slash entries). A re-run authors 0.
+          ./scripts/author-missing-columns.ps1 `
+            -SolutionZip "out/${{ github.event.client_payload.sourceSolution }}.zip" `
+            -ModelsDir   "src/generated/models" `
+            -OutZip      "out/patched.zip"
+
+      # ── DEFERRED HOOKS #2/#3/#4 (record only): unpack+PR-diff · connector/DLP allow-list · version/prefix lint ──
+
+      - name: Generate deploymentSettings.json (skeleton ⊕ app bindings)   # T7
+        run: |
+          echo '${{ toJSON(github.event.client_payload.bindings) }}' > bindings.json
+          ./scripts/gen-deployment-settings.sh \
+            ./deploymentSettings.skeleton.json \
+            bindings.json \
+            DeploymentSettings.json
+          cat DeploymentSettings.json
+
+      - name: Upload patched artifact + settings
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02   # v4
+        with:
+          name: solution-bundle
+          path: |
+            out/patched.zip
+            DeploymentSettings.json
+
+  # ── T11: server-enforced approval gate (required reviewers + prevent self-review) ──
+  import-to-target:
+    needs: build-artifact
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.client_payload.targetEnvUrl }}   # configure required reviewers on this GH Environment
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093   # v4
+        with: { name: solution-bundle }
+
+      - uses: microsoft/powerplatform-actions/actions-install@0e44beb5424af932af47250a2568eba4c259e3d8   # v1
+
+      - name: Import to TARGET with deployment settings   # T7/T8
+        uses: microsoft/powerplatform-actions/import-solution@0e44beb5424af932af47250a2568eba4c259e3d8   # v1
+        with:
+          environment-url: ${{ github.event.client_payload.targetEnvUrl }}
+          app-id:        ${{ secrets.PP_APP_ID }}
+          client-secret: ${{ secrets.PP_CLIENT_SECRET }}
+          tenant-id:     ${{ secrets.PP_TENANT_ID }}
+          solution-file: out/patched.zip
+          use-deployment-settings-file: true
+          deployment-settings-file: DeploymentSettings.json
+          run-asynchronously: true          # NOTE: input is `run-asynchronously`, NOT `async`
+          max-async-wait-time: 60
+          # convert-to-managed: true         # enable for downstream managed deploys
+
+      # T8: if this throws #760 ServiceToServiceUnauthorized, the SA-owned + SP-shared model fails →
+      # fall back to SA-OAuth import or make the deploy SP the connection OWNER.
