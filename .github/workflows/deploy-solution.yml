@@ -49,10 +49,17 @@ jobs:
     needs: echo-payload
     runs-on: ubuntu-latest       # Linux: forward-slash zip entry names (required by the zip-patch)
     steps:
-      - name: Checkout the EXACT commit the app was built from   # T-risk: commit drift (value→label maps)
+      - name: Checkout the deploy repo (self-contained for the rehearsal — D-12)
+        # Plain DEFAULT checkout of THIS repo (oss-deploy-rehearsal) at the triggering commit —
+        # no `ref:`, no app-repo dependency. This provides ./scripts/*, ./deploymentSettings.skeleton.json,
+        # and the committed models/ snapshot (deploy-repo/models/*Model.ts) that the zip-patch reads.
+        # The old step resolved an APP-repo SHA (appBuiltFromSha) inside the DEPLOY repo — which both
+        # fails (that SHA isn't a ref here) and would clobber the deploy repo's own scripts. D-12 makes
+        # the deploy repo self-sufficient for the rehearsal. `appBuiltFromSha` stays in client_payload
+        # as INFORMATIONAL (see the payload-shape comment above); the exact-app-SHA checkout (check out
+        # the app repo at appBuiltFromSha for perfectly in-sync value→label maps) is the firm-hardening
+        # follow-up (18.x — see README Option A).
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4
-        with:
-          ref: ${{ github.event.client_payload.appBuiltFromSha }}
 
       - name: Install Power Platform tools
         uses: microsoft/powerplatform-actions/actions-install@0e44beb5424af932af47250a2568eba4c259e3d8   # v1
@@ -81,7 +88,7 @@ jobs:
           # src/generated/models/*Model.ts, and re-zips (forward-slash entries). A re-run authors 0.
           ./scripts/author-missing-columns.ps1 `
             -SolutionZip "out/${{ github.event.client_payload.sourceSolution }}.zip" `
-            -ModelsDir   "src/generated/models" `
+            -ModelsDir   "models" `
             -OutZip      "out/patched.zip"
 
       # ── DEFERRED HOOKS #2/#3/#4 (record only): unpack+PR-diff · connector/DLP allow-list · version/prefix lint ──

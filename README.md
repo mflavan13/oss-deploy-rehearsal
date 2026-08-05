@@ -20,9 +20,27 @@ deploy-repo/
 │   ├── dispatch.probe.sh                    # T4 correlationId probe (verbatim copy)
 │   ├── gen-deployment-settings.sh           # T7 settings-gen (verbatim copy)
 │   └── author-missing-columns.ps1           # Phase 18 T9/D-14 parameterized port script (copy)
+├── models/                                  # committed snapshot of app src/generated/models/*Model.ts (D-12)
+│   ├── *Model.ts                            #   value→label maps the zip-patch reads (self-contained)
+│   └── README.md                            #   snapshot rationale + re-sync + firm follow-up
 ├── deploymentSettings.skeleton.json         # T7 per-solution skeleton (verbatim copy)
 └── README.md                                # this promotion log
 ```
+
+## Self-contained workflow (D-12, Wave-3 on-ramp fix)
+
+The `build-artifact` job is **self-contained**: it does a plain default checkout of **this** repo
+(no `ref:`) and reads everything it needs locally — `./scripts/*`, `./deploymentSettings.skeleton.json`,
+and the committed `models/` snapshot that the zip-patch's `-ModelsDir "models"` reads. This fixes a
+19-02 promotion-era gap surfaced by the 19-05 e2e: the original single checkout used
+`ref: appBuiltFromSha` (an **app-repo** SHA) with no `repository:`, so it failed to resolve inside the
+deploy repo and would have clobbered the repo's own scripts. `appBuiltFromSha` is retained in
+`client_payload` as **informational** (commit-drift context), not used for checkout.
+
+**Option A (deferred firm-hardening upgrade, 18.x):** instead of a committed snapshot, the
+`build-artifact` job checks out the **app repo** (`mflavan13/PowerAppCodeApp-PPTeamManagement`) at
+`appBuiltFromSha` — with a `Contents:read` PAT — so the value→label maps are always exactly the ones
+the running app was built from (no snapshot to re-sync). See `models/README.md`.
 
 ## What was promoted, and what (if anything) was authored
 
