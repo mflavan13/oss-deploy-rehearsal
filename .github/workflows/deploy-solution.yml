@@ -47,16 +47,61 @@ jobs:
 
   build-artifact:
     needs: echo-payload
-    runs-on: ubuntu-latest
-    # ⚠ REHEARSAL STUB (Phase 18 · 18-03 · T4/T11, no-tenant). The real export → zip-patch →
-    # deploymentSettings → upload steps are intentionally replaced with a no-op so that
-    # `import-to-target` becomes REACHABLE and the Environment approval gate can pause (T11).
-    # Phase 19 RESTORES the real steps — recover them from this repo's git history at the parent
-    # of this commit, or from the project's untouched `deploy-repo/.github/workflows/…` copy —
-    # once real PP_* secrets exist. DO NOT ship this stub to a tenant deploy.
+    runs-on: ubuntu-latest       # Linux: forward-slash zip entry names (required by the zip-patch)
     steps:
-      - name: REHEARSAL STUB (T4/T11 no-tenant) — Phase 19 restores the real export/patch/settings steps
-        run: echo "stub build-artifact so import-to-target is reachable at the approval gate"
+      - name: Checkout the EXACT commit the app was built from   # T-risk: commit drift (value→label maps)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4
+        with:
+          ref: ${{ github.event.client_payload.appBuiltFromSha }}
+
+      - name: Install Power Platform tools
+        uses: microsoft/powerplatform-actions/actions-install@0e44beb5424af932af47250a2568eba4c259e3d8   # v1
+
+      - name: Export (unmanaged) from SOURCE
+        uses: microsoft/powerplatform-actions/export-solution@0e44beb5424af932af47250a2568eba4c259e3d8   # v1
+        with:
+          environment-url: ${{ github.event.client_payload.sourceEnvUrl }}
+          app-id:        ${{ secrets.PP_APP_ID }}
+          client-secret: ${{ secrets.PP_CLIENT_SECRET }}
+          tenant-id:     ${{ secrets.PP_TENANT_ID }}
+          solution-name: ${{ github.event.client_payload.sourceSolution }}
+          managed: false
+          solution-output-file: out/${{ github.event.client_payload.sourceSolution }}.zip
+
+      # ── DEFERRED CODE-REVIEW HOOK #1 (record only, NOT now): Solution Checker on the RAW export ──
+      # - uses: microsoft/powerplatform-actions/check-solution@0e44beb5424af932af47250a2568eba4c259e3d8   # v1
+      #   with: { path: out/${{ github.event.client_payload.sourceSolution }}.zip, ... }
+
+      - name: ⚠ MANDATORY zip-patch (optionset export poisoning 0x8009050c)
+        shell: pwsh
+        run: |
+          # export -> PATCH -> import. The proven, PARAMETERIZED port script (Phase 18 T9 / D-14 —
+          # byte-identical + idempotent, promoted to ./scripts/author-missing-columns.ps1 here)
+          # extracts the exported solution zip, authors the dropped optionset/bit columns from
+          # src/generated/models/*Model.ts, and re-zips (forward-slash entries). A re-run authors 0.
+          ./scripts/author-missing-columns.ps1 `
+            -SolutionZip "out/${{ github.event.client_payload.sourceSolution }}.zip" `
+            -ModelsDir   "src/generated/models" `
+            -OutZip      "out/patched.zip"
+
+      # ── DEFERRED HOOKS #2/#3/#4 (record only): unpack+PR-diff · connector/DLP allow-list · version/prefix lint ──
+
+      - name: Generate deploymentSettings.json (skeleton ⊕ app bindings)   # T7
+        run: |
+          echo '${{ toJSON(github.event.client_payload.bindings) }}' > bindings.json
+          ./scripts/gen-deployment-settings.sh \
+            ./deploymentSettings.skeleton.json \
+            bindings.json \
+            DeploymentSettings.json
+          cat DeploymentSettings.json
+
+      - name: Upload patched artifact + settings
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02   # v4
+        with:
+          name: solution-bundle
+          path: |
+            out/patched.zip
+            DeploymentSettings.json
 
   # ── T11: server-enforced approval gate (required reviewers + prevent self-review) ──
   import-to-target:
@@ -68,6 +113,63 @@ jobs:
         with: { name: solution-bundle }
 
       - uses: microsoft/powerplatform-actions/actions-install@0e44beb5424af932af47250a2568eba4c259e3d8   # v1
+
+      # ── OI-5 validate-before-import (residual-risk #9 backstop — REQUIRED, not optional) ──
+      # The deploy SP re-checks that EVERY ConnectionId in DeploymentSettings.json actually
+      # resolves in the TARGET env BEFORE import. Catalog staleness + the known duplicate
+      # oss_connectioncatalog-row idempotency gap mean a ConnectionId captured at request time
+      # can be stale/wrong by import time — a stale binding must NEVER silently import (SC#4).
+      # This is the second of two gates: gen-deployment-settings.sh already fails loud on any
+      # UNBOUND ref (generation time); this fails loud if any bound ConnectionId does not resolve
+      # in the target (import time). A failed validate => a Failed DeploymentRun, never a false green.
+      - name: OI-5 validate ConnectionIds resolve in target (deploy SP)
+        shell: bash
+        env:
+          PP_APP_ID:        ${{ secrets.PP_APP_ID }}
+          PP_CLIENT_SECRET: ${{ secrets.PP_CLIENT_SECRET }}
+          PP_TENANT_ID:     ${{ secrets.PP_TENANT_ID }}
+          TARGET_URL:       ${{ github.event.client_payload.targetEnvUrl }}
+        run: |
+          set -euo pipefail
+          # Authenticate the bundled pac CLI as the DEPLOY SP against the TARGET env (same identity
+          # the import runs under) — the check must see exactly what the SP can see.
+          pac auth create \
+            --applicationId "$PP_APP_ID" \
+            --clientSecret  "$PP_CLIENT_SECRET" \
+            --tenant        "$PP_TENANT_ID" \
+            --environment   "$TARGET_URL"
+
+          # Every ConnectionId the app bound into DeploymentSettings.json. Blank refs already failed
+          # the job at generation time (gen-deployment-settings.sh); assert the non-blank ones resolve.
+          WANTED=$(jq -r '.ConnectionReferences[].ConnectionId | select(. != null and . != "")' \
+                     DeploymentSettings.json | sort -u)
+          if [ -z "$WANTED" ]; then
+            echo "::error::OI-5: no ConnectionIds present in DeploymentSettings.json — refusing to import blind"
+            exit 1
+          fi
+
+          # The connections that actually exist in the TARGET env, per the deploy SP.
+          if ! pac connection list --environment "$TARGET_URL" > pac-conns.txt 2>&1; then
+            echo "::error::OI-5: 'pac connection list' failed in target $TARGET_URL — cannot validate bindings"
+            cat pac-conns.txt
+            exit 1
+          fi
+          cat pac-conns.txt
+
+          MISSING=""
+          while IFS= read -r cid; do
+            [ -z "$cid" ] && continue
+            # A ConnectionId "resolves" iff it appears in the target env's live connection list.
+            if ! grep -qiF -- "$cid" pac-conns.txt; then
+              MISSING="$MISSING $cid"
+            fi
+          done <<< "$WANTED"
+
+          if [ -n "$MISSING" ]; then
+            echo "::error::OI-5 validate-before-import FAILED — ConnectionId(s) do not resolve in target $TARGET_URL:$MISSING"
+            exit 1
+          fi
+          echo "OI-5 OK: every bound ConnectionId resolves in target $TARGET_URL"
 
       - name: Import to TARGET with deployment settings   # T7/T8
         uses: microsoft/powerplatform-actions/import-solution@0e44beb5424af932af47250a2568eba4c259e3d8   # v1
