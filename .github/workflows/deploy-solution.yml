@@ -123,15 +123,20 @@ jobs:
 
       - uses: microsoft/powerplatform-actions/actions-install@0e44beb5424af932af47250a2568eba4c259e3d8   # v1
 
-      # ── OI-5 validate-before-import (residual-risk #9 backstop — REQUIRED, not optional) ──
-      # The deploy SP re-checks that EVERY ConnectionId in DeploymentSettings.json actually
-      # resolves in the TARGET env BEFORE import. Catalog staleness + the known duplicate
-      # oss_connectioncatalog-row idempotency gap mean a ConnectionId captured at request time
-      # can be stale/wrong by import time — a stale binding must NEVER silently import (SC#4).
-      # This is the second of two gates: gen-deployment-settings.sh already fails loud on any
-      # UNBOUND ref (generation time); this fails loud if any bound ConnectionId does not resolve
-      # in the target (import time). A failed validate => a Failed DeploymentRun, never a false green.
-      - name: OI-5 validate ConnectionIds resolve in target (deploy SP)
+      # ── OI-5 preflight (19-05 REVISED: presence = HARD gate, resolve = ADVISORY) ──
+      # HARD gate (kept): DeploymentSettings.json must carry ≥1 ConnectionId — an empty set here
+      # means gen-deployment-settings.sh produced a blind settings file (a real generation bug);
+      # refusing to import blind stays a fail-loud `exit 1`.
+      # ADVISORY (downgraded from hard): the per-ConnectionId resolve check. `pac connection list`
+      # is CALLER-SCOPED — it returns only connections OWNED by the authenticated identity. The
+      # deploy SP owns none; connections shared TO it under the Phase-18 SA-owned/SP-shared model
+      # (e.g. the T8Probe Office 365 connection) NEVER appear, so an empty/short list is expected
+      # and proves nothing about staleness. The authoritative import-time gate for a bad or stale
+      # ConnectionId is the IMPORT itself (use-deployment-settings-file: a bad id fails the import
+      # → run concludes failure → the app's status reader stamps Failed, SC#4 preserved). The two
+      # fail-loud gates are therefore: gen-settings (unbound ref, generation time) + the import
+      # (unresolvable id, import time). Everything below the hard gate warns and continues.
+      - name: OI-5 preflight — ConnectionIds present (hard) + resolve check (advisory)
         shell: bash
         env:
           PP_APP_ID:        ${{ secrets.PP_APP_ID }}
@@ -140,58 +145,65 @@ jobs:
           TARGET_URL:       ${{ github.event.client_payload.targetEnvUrl }}
         run: |
           set -euo pipefail
-          # actions-install placed the pac CLI under POWERPLATFORMTOOLS_PACPATH but did NOT add it to
-          # PATH for a custom run step (a `uses:` PP action finds it internally; a bare `pac` here does
-          # not → "pac: command not found", exit 127). Locate the pac binary and prepend its dir.
-          if ! command -v pac >/dev/null 2>&1; then
-            PAC_BIN="$(find "${POWERPLATFORMTOOLS_PACPATH:-/tmp}" -type f -name pac 2>/dev/null | head -1 || true)"
-            [ -n "$PAC_BIN" ] || { echo "::error::OI-5: pac CLI not found under POWERPLATFORMTOOLS_PACPATH (${POWERPLATFORMTOOLS_PACPATH:-unset})"; exit 1; }
-            export PATH="$(dirname "$PAC_BIN"):$PATH"
-          fi
-          # Authenticate the bundled pac CLI as the DEPLOY SP against the TARGET env (same identity
-          # the import runs under) — the check must see exactly what the SP can see.
-          # --accept-cleartext-caching: the headless Linux runner has no libsecret keyring, so pac
-          # can't cache the SP secret to refresh tokens for later calls — `pac connection list` then
-          # fails with AuthProfileSpnSecretNotFoundWithLinuxFallback. Cleartext caching on the
-          # ephemeral runner is fine (the secret is already a GitHub Actions secret).
-          pac auth create \
-            --applicationId "$PP_APP_ID" \
-            --clientSecret  "$PP_CLIENT_SECRET" \
-            --tenant        "$PP_TENANT_ID" \
-            --environment   "$TARGET_URL" \
-            --accept-cleartext-caching
-
           # Every ConnectionId the app bound into DeploymentSettings.json. Blank refs already failed
-          # the job at generation time (gen-deployment-settings.sh); assert the non-blank ones resolve.
+          # the job at generation time (gen-deployment-settings.sh); assert at least one id is bound.
           WANTED=$(jq -r '.ConnectionReferences[].ConnectionId | select(. != null and . != "")' \
                      DeploymentSettings.json | sort -u)
           if [ -z "$WANTED" ]; then
             echo "::error::OI-5: no ConnectionIds present in DeploymentSettings.json — refusing to import blind"
             exit 1
           fi
+          echo "OI-5 hard gate OK: DeploymentSettings.json carries ConnectionId(s):"
+          echo "$WANTED"
 
-          # The connections that actually exist in the TARGET env, per the deploy SP.
+          # ── advisory from here down — never fails the job ──
+          # actions-install placed the pac CLI under POWERPLATFORMTOOLS_PACPATH but did NOT add it to
+          # PATH for a custom run step (a `uses:` PP action finds it internally; a bare `pac` here does
+          # not → "pac: command not found", exit 127). Locate the pac binary and prepend its dir.
+          if ! command -v pac >/dev/null 2>&1; then
+            PAC_BIN="$(find "${POWERPLATFORMTOOLS_PACPATH:-/tmp}" -type f -name pac 2>/dev/null | head -1 || true)"
+            if [ -z "$PAC_BIN" ]; then
+              echo "::warning::OI-5 advisory: pac CLI not found — skipping the resolve check (the import is the authoritative gate)"
+              exit 0
+            fi
+            export PATH="$(dirname "$PAC_BIN"):$PATH"
+          fi
+          # Authenticate the bundled pac CLI as the DEPLOY SP against the TARGET env.
+          # --accept-cleartext-caching: the headless Linux runner has no libsecret keyring, so pac
+          # can't cache the SP secret to refresh tokens for later calls — `pac connection list` then
+          # fails with AuthProfileSpnSecretNotFoundWithLinuxFallback. Cleartext caching on the
+          # ephemeral runner is fine (the secret is already a GitHub Actions secret).
+          if ! pac auth create \
+                --applicationId "$PP_APP_ID" \
+                --clientSecret  "$PP_CLIENT_SECRET" \
+                --tenant        "$PP_TENANT_ID" \
+                --environment   "$TARGET_URL" \
+                --accept-cleartext-caching; then
+            echo "::warning::OI-5 advisory: pac auth failed — skipping the resolve check (the import is the authoritative gate)"
+            exit 0
+          fi
+
+          # What the deploy SP can SEE in the target (its OWN connections only — see step comment).
           if ! pac connection list --environment "$TARGET_URL" > pac-conns.txt 2>&1; then
-            echo "::error::OI-5: 'pac connection list' failed in target $TARGET_URL — cannot validate bindings"
-            cat pac-conns.txt
-            exit 1
+            echo "::warning::OI-5 advisory: 'pac connection list' failed in target $TARGET_URL — skipping the resolve check"
+            cat pac-conns.txt || true
+            exit 0
           fi
           cat pac-conns.txt
 
           MISSING=""
           while IFS= read -r cid; do
             [ -z "$cid" ] && continue
-            # A ConnectionId "resolves" iff it appears in the target env's live connection list.
             if ! grep -qiF -- "$cid" pac-conns.txt; then
               MISSING="$MISSING $cid"
             fi
           done <<< "$WANTED"
 
           if [ -n "$MISSING" ]; then
-            echo "::error::OI-5 validate-before-import FAILED — ConnectionId(s) do not resolve in target $TARGET_URL:$MISSING"
-            exit 1
+            echo "::warning::OI-5 advisory: ConnectionId(s) not visible to the deploy SP in $TARGET_URL:$MISSING — expected for cross-owner shared connections (pac connection list is caller-scoped); the import binding is the authoritative gate"
+          else
+            echo "OI-5 advisory: every bound ConnectionId is visible to the deploy SP in $TARGET_URL"
           fi
-          echo "OI-5 OK: every bound ConnectionId resolves in target $TARGET_URL"
 
       - name: Import to TARGET with deployment settings   # T7/T8
         uses: microsoft/powerplatform-actions/import-solution@0e44beb5424af932af47250a2568eba4c259e3d8   # v1
