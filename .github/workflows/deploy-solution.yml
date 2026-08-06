@@ -2,13 +2,35 @@
 # Covers tests T4 (dispatch + correlation), T7 (happy-path import + binding),
 # T8 (SP-bind of SA-owned connection), T11 (environment approval gate).
 #
-# To run T4/T11 WITHOUT a tenant: this file already lives in a repo's .github/workflows/;
-# set the two `secrets` to dummies, comment the pac steps, keep the echo + approval jobs.
-# To run T7/T8: supply real PP_* secrets and a scratch source->target env pair.
+# 19-08 CHAIN CONVERSION (D-15/D-17): one repository_dispatch drives a sequential
+# multi-Environment deploy — FOUR STATIC `environment:`-bound import jobs
+# (import-dev → import-qa → import-stage → import-prod), `needs:`-chained in rank
+# order. GitHub Actions jobs are STATIC YAML (no runtime job generation), so a
+# variable-length traversed chain (D-PIPE-3 — e.g. a qa→prod hotfix runs only
+# stage+prod) is expressed by guarding EVERY import job with
+#   if: ${{ !failure() && !cancelled() && contains(github.event.client_payload.chain.*.stageKey, '<stage>') }}
+# — only stages present in the app-derived ordered chain execute. `!failure()`
+# treats a SKIPPED (out-of-chain) ancestor as ok, so a chain starting above dev
+# still runs; a FAILED in-chain hop flips failure() for every later hop and stops
+# the chain (T-19-28). `build-artifact` (export → mandatory zip-patch) runs ONCE;
+# the patched zip passes to every hop via upload/download-artifact. Each hop
+# generates ITS OWN DeploymentSettings.json (client_payload bindings filtered to
+# that hop's targetEnvId — D-17) and keeps the OI-5 validate-before-import
+# backstop. Per-env target URLs come from per-env-named repo secrets
+# PP_URL_DEV / PP_URL_QA / PP_URL_STAGE / PP_URL_PROD selected by stageKey (D-21)
+# — NEVER from the payload. Stage keys are TOP-anchored per lane (19-11): a lane's
+# highest-ranked env is ALWAYS 'prod', so the D-18 reviewer gate (added on the
+# 'prod' Environment by 19-10) is structurally unskippable; dev→qa→stage
+# auto-promote ungated.
 #
-# SUPPLY CHAIN (T-18-05): every `uses:` below is PINNED to a 40-hex commit SHA; the tag
-# it resolved to is in the trailing comment. See README.md for the action -> tag -> SHA
-# table and how to re-resolve. Do not revert to a bare `@vN` tag.
+# ⚠ THE FOUR import-* JOBS ARE DELIBERATE STATIC COPIES (D-15 — GitHub has no
+# runtime job generation). They MUST stay in lockstep: edit all four together.
+# Only the stage token (env STAGE_KEY), the `environment:` name, the `needs:`
+# predecessor and the PP_URL_<STAGE> secret differ between copies.
+#
+# SUPPLY CHAIN (T-18-05/T-19-SC): every `uses:` below is PINNED to a 40-hex commit SHA;
+# the tag it resolved to is in the trailing comment. See README.md for the
+# action -> tag -> SHA table and how to re-resolve. Do not revert to a bare `@vN` tag.
 
 name: deploy-solution
 run-name: deploy-${{ github.event.client_payload.correlationId }}   # T4: correlate the 204-no-run-id dispatch
@@ -17,17 +39,26 @@ on:
   repository_dispatch:
     types: [deploy-solution]      # app fires this via the certified GitHub connector
 
-# client_payload shape the app sends (bindings nested under ONE property -> any size, <64KB):
+# client_payload shape the app sends (19-11 ENLARGED contract — Wave-1 flat fields remain):
 # {
-#   "correlationId": "oss-deploy-8f3c…",
+#   "correlationId": "<oss_deploymentrunid GUID>",                  # D-02: ONE DeploymentRun tracks this whole multi-job run
 #   "sourceSolution": "PlatformHub",
 #   "sourceEnvUrl":   "https://dev.crm.dynamics.com",
-#   "targetEnvUrl":   "https://qa.crm.dynamics.com",
+#   "targetEnvUrl":   "https://qa.crm.dynamics.com",                # INFORMATIONAL since 19-08 — hop URLs come from PP_URL_<STAGE> secrets (D-21)
 #   "appBuiltFromSha":"<git sha the running app was built from>",   # T-risk: commit drift
-#   "bindings": [
-#     { "LogicalName": "oss_sharedsql_abc12", "ConnectionId": "0f1e2d…", "ConnectorId": "/providers/Microsoft.PowerApps/apis/shared_sql" }
+#   "chain": [                                                      # D-15 — ORDERED (rank order); element order IS job order;
+#     { "stageKey": "stage", "targetEnvId": "<platform env GUID>" },#         source EXCLUDED, endpoint INCLUDED; a hop carries
+#     { "stageKey": "prod",  "targetEnvId": "<platform env GUID>" } #         EXACTLY these two keys — never a URL (D-21)
+#   ],
+#   "bindings": [                                                   # D-17 — per-hop-tagged: REQUIRED targetEnvId per binding;
+#     { "LogicalName": "oss_sharedsql_abc12", "ConnectionId": "0f1e2d…",
+#       "ConnectorId": "/providers/Microsoft.PowerApps/apis/shared_sql",
+#       "targetEnvId": "<platform env GUID>" }                      #         filter to the active hop's targetEnvId
 #   ]
 # }
+# Stage keys are TOP-anchored per lane (19-11): a 2-env lane is stage/prod, 3-env is
+# qa/stage/prod. The current MDFLLC single-hop lane therefore dispatches
+# stageKey 'prod' — its target-URL secret is PP_URL_PROD.
 
 permissions:
   contents: read
@@ -37,13 +68,20 @@ jobs:
   echo-payload:
     runs-on: ubuntu-latest
     steps:
-      - name: Show what the app sent
+      - name: Show what the app sent + assert the chain contract
         run: |
           echo "correlationId = ${{ github.event.client_payload.correlationId }}"
-          echo "target        = ${{ github.event.client_payload.targetEnvUrl }}"
-          echo "bindings (raw JSON):"
+          echo "chain (ordered, rank order — element order IS job order):"
+          echo '${{ toJSON(github.event.client_payload.chain) }}'
+          echo "bindings (raw JSON, per-hop-tagged):"
           echo '${{ toJSON(github.event.client_payload.bindings) }}'
           test -n "${{ github.event.client_payload.correlationId }}" || (echo "::error::no correlationId" && exit 1)
+          # T-19-43 backstop: an absent/empty chain would skip EVERY import job and the
+          # run would read green having deployed NOTHING. The app already refuses to fire
+          # an empty chain pre-dispatch (19-11); refuse it server-side too.
+          echo '${{ toJSON(github.event.client_payload.chain) }}' \
+            | jq -e 'type == "array" and length > 0' > /dev/null \
+            || (echo "::error::client_payload.chain missing or empty — refusing a deploy that would execute no stages" && exit 1)
 
   build-artifact:
     needs: echo-payload
@@ -93,17 +131,100 @@ jobs:
 
       # ── DEFERRED HOOKS #2/#3/#4 (record only): unpack+PR-diff · connector/DLP allow-list · version/prefix lint ──
 
-      - name: Generate deploymentSettings.json (skeleton ⊕ app bindings ⊕ per-target env vars)   # T7 / 19-09
+      - name: Upload patched artifact (per-hop DeploymentSettings are generated in each import job — D-17)
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02   # v4
+        with:
+          name: solution-bundle
+          path: out/patched.zip
+
+  # ── 19-08 hop anatomy (applies to ALL FOUR import-* jobs below) ─────────────────
+  #
+  # environment: <stageKey>   — static GitHub Environment named by stage key. GitHub
+  #   auto-creates it on first reference; 19-10 puts required reviewers + prevent-self-
+  #   review on 'prod' ONLY (D-18). The pre-19-08 URL-named Environment is retired.
+  # needs: [build-artifact, import-<prev>] — rank-order chaining; hop N+1 starts only
+  #   after hop N resolves. The `if` guard (see header) lets a skipped out-of-chain
+  #   predecessor pass while a failed in-chain predecessor stops everything downstream.
+  # Per-hop settings step — filters the per-hop-tagged bindings to THIS hop's
+  #   targetEnvId (D-17) and merges per-target env-var values (19-09/D-23), failing
+  #   loudly on: missing PP_URL_<STAGE> secret, GUID-less in-chain stage (T-19-23 —
+  #   19-06 deliberately keeps those in the chain so we fail HERE, never skip), zero
+  #   hop-tagged bindings, unbound ConnectionId, missing env-var value.
+  #
+  # OI-5 preflight (19-05 REVISED: presence = HARD gate, resolve = ADVISORY):
+  #   HARD: DeploymentSettings.json must carry ≥1 ConnectionId — an empty set means the
+  #   generation produced a blind settings file; refusing to import blind is `exit 1`.
+  #   ADVISORY: the per-ConnectionId resolve check. `pac connection list` is
+  #   CALLER-SCOPED — it returns only connections OWNED by the authenticated identity.
+  #   The deploy SP owns none; connections shared TO it under the Phase-18
+  #   SA-owned/SP-shared model NEVER appear, so an empty/short list is expected and
+  #   proves nothing about staleness. The authoritative import-time gate for a bad or
+  #   stale ConnectionId is the IMPORT itself (use-deployment-settings-file: a bad id
+  #   fails the import → run concludes failure → the app's status reader stamps Failed,
+  #   SC#4 preserved). pac path/auth notes: actions-install puts pac under
+  #   POWERPLATFORMTOOLS_PACPATH but NOT on PATH for a custom run step;
+  #   --accept-cleartext-caching is required on the headless Linux runner (no libsecret
+  #   keyring → AuthProfileSpnSecretNotFoundWithLinuxFallback otherwise).
+  #
+  # T8 note (every hop): if import throws #760 ServiceToServiceUnauthorized, the
+  #   SA-owned + SP-shared connection model fails → fall back to SA-OAuth import or
+  #   make the deploy SP the connection OWNER.
+
+  import-dev:
+    needs: [build-artifact]
+    runs-on: ubuntu-latest
+    environment: dev
+    if: ${{ !failure() && !cancelled() && contains(github.event.client_payload.chain.*.stageKey, 'dev') }}
+    steps:
+      - name: Checkout the deploy repo (scripts + skeleton + per-target env-var config — D-12)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4
+
+      - name: Download the patched solution artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093   # v4
+        with:
+          name: solution-bundle
+          path: out
+
+      - name: Generate THIS hop's DeploymentSettings.json (bindings filtered by targetEnvId — D-17)
+        shell: bash
+        env:
+          STAGE_KEY: dev
+          TARGET_URL: ${{ secrets.PP_URL_DEV }}
         run: |
-          echo '${{ toJSON(github.event.client_payload.bindings) }}' > bindings.json
+          set -euo pipefail
+          SECRET_NAME="PP_URL_$(echo "$STAGE_KEY" | tr '[:lower:]' '[:upper:]')"
+          # Per-env target URL comes from the per-env-named repo secret (D-21), never the payload.
+          if [ -z "$TARGET_URL" ]; then
+            echo "::error::secret $SECRET_NAME is not configured but stage '$STAGE_KEY' is in the derived chain — add the repo secret (owner action) before dispatching a chain that traverses this stage"
+            exit 1
+          fi
+          echo '${{ toJSON(github.event.client_payload.chain) }}' > chain.json
+          echo '${{ toJSON(github.event.client_payload.bindings) }}' > bindings-all.json
+
+          # This hop's target env GUID from the ordered chain. 19-06 deliberately KEEPS
+          # GUID-less intermediate stages in the chain so the workflow fails LOUDLY here
+          # instead of silently skipping a hop (T-19-23).
+          HOP_ENV_ID=$(jq -r --arg k "$STAGE_KEY" '[ .[] | select(.stageKey == $k) ][0].targetEnvId // empty' chain.json)
+          if [ -z "$HOP_ENV_ID" ]; then
+            echo "::error::stage '$STAGE_KEY' is in the derived chain but carries no targetEnvId (GUID-less stage) — refusing to skip it (T-19-23); fix the environment's inventory GUID and re-dispatch"
+            exit 1
+          fi
+          echo "hop $STAGE_KEY -> targetEnvId $HOP_ENV_ID"
+
+          # D-17: THIS hop's bindings only — filter the per-hop-tagged union to this target env.
+          jq --arg id "$HOP_ENV_ID" '[ .[] | select(.targetEnvId == $id) ]' bindings-all.json > bindings.json
+          if [ "$(jq 'length' bindings.json)" = "0" ]; then
+            echo "::error::no bindings tagged for targetEnvId $HOP_ENV_ID (stage '$STAGE_KEY') — the app tags every binding per hop (19-11); tags present: $(jq -r '[ .[].targetEnvId ] | unique | join(", ")' bindings-all.json)"
+            exit 1
+          fi
+
           # 19-09 (OI-1 option A / D-23): per-target env-var VALUES come from a committed,
           # MAINTAINED config file keyed by the target env's first host label — never copied
           # from source. Secret-type vars carry @Microsoft.KeyVault(...) REFERENCES only.
           # gen-deployment-settings.sh fail-louds if a declared var has no target value.
-          ENVKEY=$(echo '${{ github.event.client_payload.targetEnvUrl }}' | sed -E 's#^https?://##; s#[./].*$##')
+          # Invoke via `bash` so the checked-out .sh does not need the +x execute bit.
+          ENVKEY=$(echo "$TARGET_URL" | sed -E 's#^https?://##; s#[./].*$##')
           echo "per-target env-var config: config/env-vars.${ENVKEY}.json"
-          # Invoke via `bash` so the checked-out .sh does not need the +x execute bit
-          # (git on Windows / robocopy mirror doesn't carry the mode → exit 126 otherwise).
           bash ./scripts/gen-deployment-settings.sh \
             ./deploymentSettings.skeleton.json \
             bindings.json \
@@ -111,49 +232,20 @@ jobs:
             "./config/env-vars.${ENVKEY}.json"
           cat DeploymentSettings.json
 
-      - name: Upload patched artifact + settings
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02   # v4
-        with:
-          name: solution-bundle
-          path: |
-            out/patched.zip
-            DeploymentSettings.json
-
-  # ── T11: server-enforced approval gate (required reviewers + prevent self-review) ──
-  import-to-target:
-    needs: build-artifact
-    runs-on: ubuntu-latest
-    environment: ${{ github.event.client_payload.targetEnvUrl }}   # configure required reviewers on this GH Environment
-    steps:
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093   # v4
-        with: { name: solution-bundle }
-
       - uses: microsoft/powerplatform-actions/actions-install@0e44beb5424af932af47250a2568eba4c259e3d8   # v1
 
-      # ── OI-5 preflight (19-05 REVISED: presence = HARD gate, resolve = ADVISORY) ──
-      # HARD gate (kept): DeploymentSettings.json must carry ≥1 ConnectionId — an empty set here
-      # means gen-deployment-settings.sh produced a blind settings file (a real generation bug);
-      # refusing to import blind stays a fail-loud `exit 1`.
-      # ADVISORY (downgraded from hard): the per-ConnectionId resolve check. `pac connection list`
-      # is CALLER-SCOPED — it returns only connections OWNED by the authenticated identity. The
-      # deploy SP owns none; connections shared TO it under the Phase-18 SA-owned/SP-shared model
-      # (e.g. the T8Probe Office 365 connection) NEVER appear, so an empty/short list is expected
-      # and proves nothing about staleness. The authoritative import-time gate for a bad or stale
-      # ConnectionId is the IMPORT itself (use-deployment-settings-file: a bad id fails the import
-      # → run concludes failure → the app's status reader stamps Failed, SC#4 preserved). The two
-      # fail-loud gates are therefore: gen-settings (unbound ref, generation time) + the import
-      # (unresolvable id, import time). Everything below the hard gate warns and continues.
+      # Rationale + hard/advisory split: see the "OI-5 preflight" block comment above the import-* jobs.
       - name: OI-5 preflight — ConnectionIds present (hard) + resolve check (advisory)
         shell: bash
         env:
           PP_APP_ID:        ${{ secrets.PP_APP_ID }}
           PP_CLIENT_SECRET: ${{ secrets.PP_CLIENT_SECRET }}
           PP_TENANT_ID:     ${{ secrets.PP_TENANT_ID }}
-          TARGET_URL:       ${{ github.event.client_payload.targetEnvUrl }}
+          TARGET_URL:       ${{ secrets.PP_URL_DEV }}
         run: |
           set -euo pipefail
-          # Every ConnectionId the app bound into DeploymentSettings.json. Blank refs already failed
-          # the job at generation time (gen-deployment-settings.sh); assert at least one id is bound.
+          # Every ConnectionId the app bound into THIS hop's DeploymentSettings.json. Blank refs
+          # already failed at generation time; assert at least one id is bound (HARD gate).
           WANTED=$(jq -r '.ConnectionReferences[].ConnectionId | select(. != null and . != "")' \
                      DeploymentSettings.json | sort -u)
           if [ -z "$WANTED" ]; then
@@ -164,9 +256,6 @@ jobs:
           echo "$WANTED"
 
           # ── advisory from here down — never fails the job ──
-          # actions-install placed the pac CLI under POWERPLATFORMTOOLS_PACPATH but did NOT add it to
-          # PATH for a custom run step (a `uses:` PP action finds it internally; a bare `pac` here does
-          # not → "pac: command not found", exit 127). Locate the pac binary and prepend its dir.
           if ! command -v pac >/dev/null 2>&1; then
             PAC_BIN="$(find "${POWERPLATFORMTOOLS_PACPATH:-/tmp}" -type f -name pac 2>/dev/null | head -1 || true)"
             if [ -z "$PAC_BIN" ]; then
@@ -175,11 +264,6 @@ jobs:
             fi
             export PATH="$(dirname "$PAC_BIN"):$PATH"
           fi
-          # Authenticate the bundled pac CLI as the DEPLOY SP against the TARGET env.
-          # --accept-cleartext-caching: the headless Linux runner has no libsecret keyring, so pac
-          # can't cache the SP secret to refresh tokens for later calls — `pac connection list` then
-          # fails with AuthProfileSpnSecretNotFoundWithLinuxFallback. Cleartext caching on the
-          # ephemeral runner is fine (the secret is already a GitHub Actions secret).
           if ! pac auth create \
                 --applicationId "$PP_APP_ID" \
                 --clientSecret  "$PP_CLIENT_SECRET" \
@@ -190,7 +274,7 @@ jobs:
             exit 0
           fi
 
-          # What the deploy SP can SEE in the target (its OWN connections only — see step comment).
+          # What the deploy SP can SEE in the target (its OWN connections only — caller-scoped).
           if ! pac connection list --environment "$TARGET_URL" > pac-conns.txt 2>&1; then
             echo "::warning::OI-5 advisory: 'pac connection list' failed in target $TARGET_URL — skipping the resolve check"
             cat pac-conns.txt || true
@@ -212,10 +296,10 @@ jobs:
             echo "OI-5 advisory: every bound ConnectionId is visible to the deploy SP in $TARGET_URL"
           fi
 
-      - name: Import to TARGET with deployment settings   # T7/T8
+      - name: Import to dev with THIS hop's deployment settings   # T7/T8
         uses: microsoft/powerplatform-actions/import-solution@0e44beb5424af932af47250a2568eba4c259e3d8   # v1
         with:
-          environment-url: ${{ github.event.client_payload.targetEnvUrl }}
+          environment-url: ${{ secrets.PP_URL_DEV }}
           app-id:        ${{ secrets.PP_APP_ID }}
           client-secret: ${{ secrets.PP_CLIENT_SECRET }}
           tenant-id:     ${{ secrets.PP_TENANT_ID }}
@@ -226,5 +310,422 @@ jobs:
           max-async-wait-time: 60
           # convert-to-managed: true         # enable for downstream managed deploys
 
-      # T8: if this throws #760 ServiceToServiceUnauthorized, the SA-owned + SP-shared model fails →
-      # fall back to SA-OAuth import or make the deploy SP the connection OWNER.
+  import-qa:
+    needs: [build-artifact, import-dev]
+    runs-on: ubuntu-latest
+    environment: qa
+    if: ${{ !failure() && !cancelled() && contains(github.event.client_payload.chain.*.stageKey, 'qa') }}
+    steps:
+      - name: Checkout the deploy repo (scripts + skeleton + per-target env-var config — D-12)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4
+
+      - name: Download the patched solution artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093   # v4
+        with:
+          name: solution-bundle
+          path: out
+
+      - name: Generate THIS hop's DeploymentSettings.json (bindings filtered by targetEnvId — D-17)
+        shell: bash
+        env:
+          STAGE_KEY: qa
+          TARGET_URL: ${{ secrets.PP_URL_QA }}
+        run: |
+          set -euo pipefail
+          SECRET_NAME="PP_URL_$(echo "$STAGE_KEY" | tr '[:lower:]' '[:upper:]')"
+          # Per-env target URL comes from the per-env-named repo secret (D-21), never the payload.
+          if [ -z "$TARGET_URL" ]; then
+            echo "::error::secret $SECRET_NAME is not configured but stage '$STAGE_KEY' is in the derived chain — add the repo secret (owner action) before dispatching a chain that traverses this stage"
+            exit 1
+          fi
+          echo '${{ toJSON(github.event.client_payload.chain) }}' > chain.json
+          echo '${{ toJSON(github.event.client_payload.bindings) }}' > bindings-all.json
+
+          # This hop's target env GUID from the ordered chain. 19-06 deliberately KEEPS
+          # GUID-less intermediate stages in the chain so the workflow fails LOUDLY here
+          # instead of silently skipping a hop (T-19-23).
+          HOP_ENV_ID=$(jq -r --arg k "$STAGE_KEY" '[ .[] | select(.stageKey == $k) ][0].targetEnvId // empty' chain.json)
+          if [ -z "$HOP_ENV_ID" ]; then
+            echo "::error::stage '$STAGE_KEY' is in the derived chain but carries no targetEnvId (GUID-less stage) — refusing to skip it (T-19-23); fix the environment's inventory GUID and re-dispatch"
+            exit 1
+          fi
+          echo "hop $STAGE_KEY -> targetEnvId $HOP_ENV_ID"
+
+          # D-17: THIS hop's bindings only — filter the per-hop-tagged union to this target env.
+          jq --arg id "$HOP_ENV_ID" '[ .[] | select(.targetEnvId == $id) ]' bindings-all.json > bindings.json
+          if [ "$(jq 'length' bindings.json)" = "0" ]; then
+            echo "::error::no bindings tagged for targetEnvId $HOP_ENV_ID (stage '$STAGE_KEY') — the app tags every binding per hop (19-11); tags present: $(jq -r '[ .[].targetEnvId ] | unique | join(", ")' bindings-all.json)"
+            exit 1
+          fi
+
+          # 19-09 (OI-1 option A / D-23): per-target env-var VALUES come from a committed,
+          # MAINTAINED config file keyed by the target env's first host label — never copied
+          # from source. Secret-type vars carry @Microsoft.KeyVault(...) REFERENCES only.
+          # gen-deployment-settings.sh fail-louds if a declared var has no target value.
+          # Invoke via `bash` so the checked-out .sh does not need the +x execute bit.
+          ENVKEY=$(echo "$TARGET_URL" | sed -E 's#^https?://##; s#[./].*$##')
+          echo "per-target env-var config: config/env-vars.${ENVKEY}.json"
+          bash ./scripts/gen-deployment-settings.sh \
+            ./deploymentSettings.skeleton.json \
+            bindings.json \
+            DeploymentSettings.json \
+            "./config/env-vars.${ENVKEY}.json"
+          cat DeploymentSettings.json
+
+      - uses: microsoft/powerplatform-actions/actions-install@0e44beb5424af932af47250a2568eba4c259e3d8   # v1
+
+      # Rationale + hard/advisory split: see the "OI-5 preflight" block comment above the import-* jobs.
+      - name: OI-5 preflight — ConnectionIds present (hard) + resolve check (advisory)
+        shell: bash
+        env:
+          PP_APP_ID:        ${{ secrets.PP_APP_ID }}
+          PP_CLIENT_SECRET: ${{ secrets.PP_CLIENT_SECRET }}
+          PP_TENANT_ID:     ${{ secrets.PP_TENANT_ID }}
+          TARGET_URL:       ${{ secrets.PP_URL_QA }}
+        run: |
+          set -euo pipefail
+          # Every ConnectionId the app bound into THIS hop's DeploymentSettings.json. Blank refs
+          # already failed at generation time; assert at least one id is bound (HARD gate).
+          WANTED=$(jq -r '.ConnectionReferences[].ConnectionId | select(. != null and . != "")' \
+                     DeploymentSettings.json | sort -u)
+          if [ -z "$WANTED" ]; then
+            echo "::error::OI-5: no ConnectionIds present in DeploymentSettings.json — refusing to import blind"
+            exit 1
+          fi
+          echo "OI-5 hard gate OK: DeploymentSettings.json carries ConnectionId(s):"
+          echo "$WANTED"
+
+          # ── advisory from here down — never fails the job ──
+          if ! command -v pac >/dev/null 2>&1; then
+            PAC_BIN="$(find "${POWERPLATFORMTOOLS_PACPATH:-/tmp}" -type f -name pac 2>/dev/null | head -1 || true)"
+            if [ -z "$PAC_BIN" ]; then
+              echo "::warning::OI-5 advisory: pac CLI not found — skipping the resolve check (the import is the authoritative gate)"
+              exit 0
+            fi
+            export PATH="$(dirname "$PAC_BIN"):$PATH"
+          fi
+          if ! pac auth create \
+                --applicationId "$PP_APP_ID" \
+                --clientSecret  "$PP_CLIENT_SECRET" \
+                --tenant        "$PP_TENANT_ID" \
+                --environment   "$TARGET_URL" \
+                --accept-cleartext-caching; then
+            echo "::warning::OI-5 advisory: pac auth failed — skipping the resolve check (the import is the authoritative gate)"
+            exit 0
+          fi
+
+          # What the deploy SP can SEE in the target (its OWN connections only — caller-scoped).
+          if ! pac connection list --environment "$TARGET_URL" > pac-conns.txt 2>&1; then
+            echo "::warning::OI-5 advisory: 'pac connection list' failed in target $TARGET_URL — skipping the resolve check"
+            cat pac-conns.txt || true
+            exit 0
+          fi
+          cat pac-conns.txt
+
+          MISSING=""
+          while IFS= read -r cid; do
+            [ -z "$cid" ] && continue
+            if ! grep -qiF -- "$cid" pac-conns.txt; then
+              MISSING="$MISSING $cid"
+            fi
+          done <<< "$WANTED"
+
+          if [ -n "$MISSING" ]; then
+            echo "::warning::OI-5 advisory: ConnectionId(s) not visible to the deploy SP in $TARGET_URL:$MISSING — expected for cross-owner shared connections (pac connection list is caller-scoped); the import binding is the authoritative gate"
+          else
+            echo "OI-5 advisory: every bound ConnectionId is visible to the deploy SP in $TARGET_URL"
+          fi
+
+      - name: Import to qa with THIS hop's deployment settings   # T7/T8
+        uses: microsoft/powerplatform-actions/import-solution@0e44beb5424af932af47250a2568eba4c259e3d8   # v1
+        with:
+          environment-url: ${{ secrets.PP_URL_QA }}
+          app-id:        ${{ secrets.PP_APP_ID }}
+          client-secret: ${{ secrets.PP_CLIENT_SECRET }}
+          tenant-id:     ${{ secrets.PP_TENANT_ID }}
+          solution-file: out/patched.zip
+          use-deployment-settings-file: true
+          deployment-settings-file: DeploymentSettings.json
+          run-asynchronously: true          # NOTE: input is `run-asynchronously`, NOT `async`
+          max-async-wait-time: 60
+          # convert-to-managed: true         # enable for downstream managed deploys
+
+  import-stage:
+    needs: [build-artifact, import-qa]
+    runs-on: ubuntu-latest
+    environment: stage
+    if: ${{ !failure() && !cancelled() && contains(github.event.client_payload.chain.*.stageKey, 'stage') }}
+    steps:
+      - name: Checkout the deploy repo (scripts + skeleton + per-target env-var config — D-12)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4
+
+      - name: Download the patched solution artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093   # v4
+        with:
+          name: solution-bundle
+          path: out
+
+      - name: Generate THIS hop's DeploymentSettings.json (bindings filtered by targetEnvId — D-17)
+        shell: bash
+        env:
+          STAGE_KEY: stage
+          TARGET_URL: ${{ secrets.PP_URL_STAGE }}
+        run: |
+          set -euo pipefail
+          SECRET_NAME="PP_URL_$(echo "$STAGE_KEY" | tr '[:lower:]' '[:upper:]')"
+          # Per-env target URL comes from the per-env-named repo secret (D-21), never the payload.
+          if [ -z "$TARGET_URL" ]; then
+            echo "::error::secret $SECRET_NAME is not configured but stage '$STAGE_KEY' is in the derived chain — add the repo secret (owner action) before dispatching a chain that traverses this stage"
+            exit 1
+          fi
+          echo '${{ toJSON(github.event.client_payload.chain) }}' > chain.json
+          echo '${{ toJSON(github.event.client_payload.bindings) }}' > bindings-all.json
+
+          # This hop's target env GUID from the ordered chain. 19-06 deliberately KEEPS
+          # GUID-less intermediate stages in the chain so the workflow fails LOUDLY here
+          # instead of silently skipping a hop (T-19-23).
+          HOP_ENV_ID=$(jq -r --arg k "$STAGE_KEY" '[ .[] | select(.stageKey == $k) ][0].targetEnvId // empty' chain.json)
+          if [ -z "$HOP_ENV_ID" ]; then
+            echo "::error::stage '$STAGE_KEY' is in the derived chain but carries no targetEnvId (GUID-less stage) — refusing to skip it (T-19-23); fix the environment's inventory GUID and re-dispatch"
+            exit 1
+          fi
+          echo "hop $STAGE_KEY -> targetEnvId $HOP_ENV_ID"
+
+          # D-17: THIS hop's bindings only — filter the per-hop-tagged union to this target env.
+          jq --arg id "$HOP_ENV_ID" '[ .[] | select(.targetEnvId == $id) ]' bindings-all.json > bindings.json
+          if [ "$(jq 'length' bindings.json)" = "0" ]; then
+            echo "::error::no bindings tagged for targetEnvId $HOP_ENV_ID (stage '$STAGE_KEY') — the app tags every binding per hop (19-11); tags present: $(jq -r '[ .[].targetEnvId ] | unique | join(", ")' bindings-all.json)"
+            exit 1
+          fi
+
+          # 19-09 (OI-1 option A / D-23): per-target env-var VALUES come from a committed,
+          # MAINTAINED config file keyed by the target env's first host label — never copied
+          # from source. Secret-type vars carry @Microsoft.KeyVault(...) REFERENCES only.
+          # gen-deployment-settings.sh fail-louds if a declared var has no target value.
+          # Invoke via `bash` so the checked-out .sh does not need the +x execute bit.
+          ENVKEY=$(echo "$TARGET_URL" | sed -E 's#^https?://##; s#[./].*$##')
+          echo "per-target env-var config: config/env-vars.${ENVKEY}.json"
+          bash ./scripts/gen-deployment-settings.sh \
+            ./deploymentSettings.skeleton.json \
+            bindings.json \
+            DeploymentSettings.json \
+            "./config/env-vars.${ENVKEY}.json"
+          cat DeploymentSettings.json
+
+      - uses: microsoft/powerplatform-actions/actions-install@0e44beb5424af932af47250a2568eba4c259e3d8   # v1
+
+      # Rationale + hard/advisory split: see the "OI-5 preflight" block comment above the import-* jobs.
+      - name: OI-5 preflight — ConnectionIds present (hard) + resolve check (advisory)
+        shell: bash
+        env:
+          PP_APP_ID:        ${{ secrets.PP_APP_ID }}
+          PP_CLIENT_SECRET: ${{ secrets.PP_CLIENT_SECRET }}
+          PP_TENANT_ID:     ${{ secrets.PP_TENANT_ID }}
+          TARGET_URL:       ${{ secrets.PP_URL_STAGE }}
+        run: |
+          set -euo pipefail
+          # Every ConnectionId the app bound into THIS hop's DeploymentSettings.json. Blank refs
+          # already failed at generation time; assert at least one id is bound (HARD gate).
+          WANTED=$(jq -r '.ConnectionReferences[].ConnectionId | select(. != null and . != "")' \
+                     DeploymentSettings.json | sort -u)
+          if [ -z "$WANTED" ]; then
+            echo "::error::OI-5: no ConnectionIds present in DeploymentSettings.json — refusing to import blind"
+            exit 1
+          fi
+          echo "OI-5 hard gate OK: DeploymentSettings.json carries ConnectionId(s):"
+          echo "$WANTED"
+
+          # ── advisory from here down — never fails the job ──
+          if ! command -v pac >/dev/null 2>&1; then
+            PAC_BIN="$(find "${POWERPLATFORMTOOLS_PACPATH:-/tmp}" -type f -name pac 2>/dev/null | head -1 || true)"
+            if [ -z "$PAC_BIN" ]; then
+              echo "::warning::OI-5 advisory: pac CLI not found — skipping the resolve check (the import is the authoritative gate)"
+              exit 0
+            fi
+            export PATH="$(dirname "$PAC_BIN"):$PATH"
+          fi
+          if ! pac auth create \
+                --applicationId "$PP_APP_ID" \
+                --clientSecret  "$PP_CLIENT_SECRET" \
+                --tenant        "$PP_TENANT_ID" \
+                --environment   "$TARGET_URL" \
+                --accept-cleartext-caching; then
+            echo "::warning::OI-5 advisory: pac auth failed — skipping the resolve check (the import is the authoritative gate)"
+            exit 0
+          fi
+
+          # What the deploy SP can SEE in the target (its OWN connections only — caller-scoped).
+          if ! pac connection list --environment "$TARGET_URL" > pac-conns.txt 2>&1; then
+            echo "::warning::OI-5 advisory: 'pac connection list' failed in target $TARGET_URL — skipping the resolve check"
+            cat pac-conns.txt || true
+            exit 0
+          fi
+          cat pac-conns.txt
+
+          MISSING=""
+          while IFS= read -r cid; do
+            [ -z "$cid" ] && continue
+            if ! grep -qiF -- "$cid" pac-conns.txt; then
+              MISSING="$MISSING $cid"
+            fi
+          done <<< "$WANTED"
+
+          if [ -n "$MISSING" ]; then
+            echo "::warning::OI-5 advisory: ConnectionId(s) not visible to the deploy SP in $TARGET_URL:$MISSING — expected for cross-owner shared connections (pac connection list is caller-scoped); the import binding is the authoritative gate"
+          else
+            echo "OI-5 advisory: every bound ConnectionId is visible to the deploy SP in $TARGET_URL"
+          fi
+
+      - name: Import to stage with THIS hop's deployment settings   # T7/T8
+        uses: microsoft/powerplatform-actions/import-solution@0e44beb5424af932af47250a2568eba4c259e3d8   # v1
+        with:
+          environment-url: ${{ secrets.PP_URL_STAGE }}
+          app-id:        ${{ secrets.PP_APP_ID }}
+          client-secret: ${{ secrets.PP_CLIENT_SECRET }}
+          tenant-id:     ${{ secrets.PP_TENANT_ID }}
+          solution-file: out/patched.zip
+          use-deployment-settings-file: true
+          deployment-settings-file: DeploymentSettings.json
+          run-asynchronously: true          # NOTE: input is `run-asynchronously`, NOT `async`
+          max-async-wait-time: 60
+          # convert-to-managed: true         # enable for downstream managed deploys
+
+  import-prod:
+    needs: [build-artifact, import-stage]
+    runs-on: ubuntu-latest
+    environment: prod                # 19-10 adds required reviewers + prevent-self-review HERE only (D-18)
+    if: ${{ !failure() && !cancelled() && contains(github.event.client_payload.chain.*.stageKey, 'prod') }}
+    steps:
+      - name: Checkout the deploy repo (scripts + skeleton + per-target env-var config — D-12)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4
+
+      - name: Download the patched solution artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093   # v4
+        with:
+          name: solution-bundle
+          path: out
+
+      - name: Generate THIS hop's DeploymentSettings.json (bindings filtered by targetEnvId — D-17)
+        shell: bash
+        env:
+          STAGE_KEY: prod
+          TARGET_URL: ${{ secrets.PP_URL_PROD }}
+        run: |
+          set -euo pipefail
+          SECRET_NAME="PP_URL_$(echo "$STAGE_KEY" | tr '[:lower:]' '[:upper:]')"
+          # Per-env target URL comes from the per-env-named repo secret (D-21), never the payload.
+          if [ -z "$TARGET_URL" ]; then
+            echo "::error::secret $SECRET_NAME is not configured but stage '$STAGE_KEY' is in the derived chain — add the repo secret (owner action) before dispatching a chain that traverses this stage"
+            exit 1
+          fi
+          echo '${{ toJSON(github.event.client_payload.chain) }}' > chain.json
+          echo '${{ toJSON(github.event.client_payload.bindings) }}' > bindings-all.json
+
+          # This hop's target env GUID from the ordered chain. 19-06 deliberately KEEPS
+          # GUID-less intermediate stages in the chain so the workflow fails LOUDLY here
+          # instead of silently skipping a hop (T-19-23).
+          HOP_ENV_ID=$(jq -r --arg k "$STAGE_KEY" '[ .[] | select(.stageKey == $k) ][0].targetEnvId // empty' chain.json)
+          if [ -z "$HOP_ENV_ID" ]; then
+            echo "::error::stage '$STAGE_KEY' is in the derived chain but carries no targetEnvId (GUID-less stage) — refusing to skip it (T-19-23); fix the environment's inventory GUID and re-dispatch"
+            exit 1
+          fi
+          echo "hop $STAGE_KEY -> targetEnvId $HOP_ENV_ID"
+
+          # D-17: THIS hop's bindings only — filter the per-hop-tagged union to this target env.
+          jq --arg id "$HOP_ENV_ID" '[ .[] | select(.targetEnvId == $id) ]' bindings-all.json > bindings.json
+          if [ "$(jq 'length' bindings.json)" = "0" ]; then
+            echo "::error::no bindings tagged for targetEnvId $HOP_ENV_ID (stage '$STAGE_KEY') — the app tags every binding per hop (19-11); tags present: $(jq -r '[ .[].targetEnvId ] | unique | join(", ")' bindings-all.json)"
+            exit 1
+          fi
+
+          # 19-09 (OI-1 option A / D-23): per-target env-var VALUES come from a committed,
+          # MAINTAINED config file keyed by the target env's first host label — never copied
+          # from source. Secret-type vars carry @Microsoft.KeyVault(...) REFERENCES only.
+          # gen-deployment-settings.sh fail-louds if a declared var has no target value.
+          # Invoke via `bash` so the checked-out .sh does not need the +x execute bit.
+          ENVKEY=$(echo "$TARGET_URL" | sed -E 's#^https?://##; s#[./].*$##')
+          echo "per-target env-var config: config/env-vars.${ENVKEY}.json"
+          bash ./scripts/gen-deployment-settings.sh \
+            ./deploymentSettings.skeleton.json \
+            bindings.json \
+            DeploymentSettings.json \
+            "./config/env-vars.${ENVKEY}.json"
+          cat DeploymentSettings.json
+
+      - uses: microsoft/powerplatform-actions/actions-install@0e44beb5424af932af47250a2568eba4c259e3d8   # v1
+
+      # Rationale + hard/advisory split: see the "OI-5 preflight" block comment above the import-* jobs.
+      - name: OI-5 preflight — ConnectionIds present (hard) + resolve check (advisory)
+        shell: bash
+        env:
+          PP_APP_ID:        ${{ secrets.PP_APP_ID }}
+          PP_CLIENT_SECRET: ${{ secrets.PP_CLIENT_SECRET }}
+          PP_TENANT_ID:     ${{ secrets.PP_TENANT_ID }}
+          TARGET_URL:       ${{ secrets.PP_URL_PROD }}
+        run: |
+          set -euo pipefail
+          # Every ConnectionId the app bound into THIS hop's DeploymentSettings.json. Blank refs
+          # already failed at generation time; assert at least one id is bound (HARD gate).
+          WANTED=$(jq -r '.ConnectionReferences[].ConnectionId | select(. != null and . != "")' \
+                     DeploymentSettings.json | sort -u)
+          if [ -z "$WANTED" ]; then
+            echo "::error::OI-5: no ConnectionIds present in DeploymentSettings.json — refusing to import blind"
+            exit 1
+          fi
+          echo "OI-5 hard gate OK: DeploymentSettings.json carries ConnectionId(s):"
+          echo "$WANTED"
+
+          # ── advisory from here down — never fails the job ──
+          if ! command -v pac >/dev/null 2>&1; then
+            PAC_BIN="$(find "${POWERPLATFORMTOOLS_PACPATH:-/tmp}" -type f -name pac 2>/dev/null | head -1 || true)"
+            if [ -z "$PAC_BIN" ]; then
+              echo "::warning::OI-5 advisory: pac CLI not found — skipping the resolve check (the import is the authoritative gate)"
+              exit 0
+            fi
+            export PATH="$(dirname "$PAC_BIN"):$PATH"
+          fi
+          if ! pac auth create \
+                --applicationId "$PP_APP_ID" \
+                --clientSecret  "$PP_CLIENT_SECRET" \
+                --tenant        "$PP_TENANT_ID" \
+                --environment   "$TARGET_URL" \
+                --accept-cleartext-caching; then
+            echo "::warning::OI-5 advisory: pac auth failed — skipping the resolve check (the import is the authoritative gate)"
+            exit 0
+          fi
+
+          # What the deploy SP can SEE in the target (its OWN connections only — caller-scoped).
+          if ! pac connection list --environment "$TARGET_URL" > pac-conns.txt 2>&1; then
+            echo "::warning::OI-5 advisory: 'pac connection list' failed in target $TARGET_URL — skipping the resolve check"
+            cat pac-conns.txt || true
+            exit 0
+          fi
+          cat pac-conns.txt
+
+          MISSING=""
+          while IFS= read -r cid; do
+            [ -z "$cid" ] && continue
+            if ! grep -qiF -- "$cid" pac-conns.txt; then
+              MISSING="$MISSING $cid"
+            fi
+          done <<< "$WANTED"
+
+          if [ -n "$MISSING" ]; then
+            echo "::warning::OI-5 advisory: ConnectionId(s) not visible to the deploy SP in $TARGET_URL:$MISSING — expected for cross-owner shared connections (pac connection list is caller-scoped); the import binding is the authoritative gate"
+          else
+            echo "OI-5 advisory: every bound ConnectionId is visible to the deploy SP in $TARGET_URL"
+          fi
+
+      - name: Import to prod with THIS hop's deployment settings   # T7/T8
+        uses: microsoft/powerplatform-actions/import-solution@0e44beb5424af932af47250a2568eba4c259e3d8   # v1
+        with:
+          environment-url: ${{ secrets.PP_URL_PROD }}
+          app-id:        ${{ secrets.PP_APP_ID }}
+          client-secret: ${{ secrets.PP_CLIENT_SECRET }}
+          tenant-id:     ${{ secrets.PP_TENANT_ID }}
+          solution-file: out/patched.zip
+          use-deployment-settings-file: true
+          deployment-settings-file: DeploymentSettings.json
+          run-asynchronously: true          # NOTE: input is `run-asynchronously`, NOT `async`
+          max-async-wait-time: 60
+          # convert-to-managed: true         # enable for downstream managed deploys
