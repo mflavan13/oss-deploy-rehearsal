@@ -1,0 +1,27 @@
+[
+  {
+    "_doc": [
+      "config/env-vars.<envkey>.json — per-target MAINTAINED environment-variable values (19-09, OI-1 option A / D-23).",
+      "<envkey> = the target env URL's first host label (https://org66725818.crm.dynamics.com -> org66725818), derived by deploy-solution.yml.",
+      "The committed deploymentSettings.skeleton.json DECLARES the solution's env-var SchemaNames (no values);",
+      "this file SUPPLIES the per-target Value for every declared SchemaName. gen-deployment-settings.sh merges",
+      "by SchemaName and FAILS THE JOB LOUDLY if any declared SchemaName is missing or empty here — no silent skips.",
+      "Values are NEVER copied from the source environment (D-23): maintain them here, per target, PR-reviewed.",
+      "Entries not declared by the skeleton are ignored with a notice. `_doc` keys are documentation only (ignored by the merge)."
+    ],
+    "SchemaName": "oss_ExampleApiBaseUrl",
+    "Value": "https://api.example-target.contoso.com"
+  },
+  {
+    "_doc": [
+      "SECRET-TYPE / KEY VAULT env vars (D-23/D-21): commit the Key Vault REFERENCE ONLY — NEVER the raw secret.",
+      "The raw secret stays in Azure Key Vault and is resolved by Power Platform IN THE TARGET environment;",
+      "it never enters this repo, GitHub secrets, or the dispatch payload. A reference is not a secret — committing it is safe.",
+      "Reference forms: '@Microsoft.KeyVault(SecretUri=https://<vault>.vault.azure.net/secrets/<name>)' or the Azure",
+      "resource path '/subscriptions/<sub>/resourceGroups/<rg>/providers/Microsoft.KeyVault/vaults/<vault>/secrets/<name>'.",
+      "A raw secret value anywhere in a committed env-vars file is a defect (threat T-19-31) — fix the leak and rotate the secret."
+    ],
+    "SchemaName": "oss_ExampleServiceApiKey",
+    "Value": "@Microsoft.KeyVault(SecretUri=https://contoso-vault.vault.azure.net/secrets/oss-example-service-api-key)"
+  }
+]

@@ -93,15 +93,22 @@ jobs:
 
       # ── DEFERRED HOOKS #2/#3/#4 (record only): unpack+PR-diff · connector/DLP allow-list · version/prefix lint ──
 
-      - name: Generate deploymentSettings.json (skeleton ⊕ app bindings)   # T7
+      - name: Generate deploymentSettings.json (skeleton ⊕ app bindings ⊕ per-target env vars)   # T7 / 19-09
         run: |
           echo '${{ toJSON(github.event.client_payload.bindings) }}' > bindings.json
+          # 19-09 (OI-1 option A / D-23): per-target env-var VALUES come from a committed,
+          # MAINTAINED config file keyed by the target env's first host label — never copied
+          # from source. Secret-type vars carry @Microsoft.KeyVault(...) REFERENCES only.
+          # gen-deployment-settings.sh fail-louds if a declared var has no target value.
+          ENVKEY=$(echo '${{ github.event.client_payload.targetEnvUrl }}' | sed -E 's#^https?://##; s#[./].*$##')
+          echo "per-target env-var config: config/env-vars.${ENVKEY}.json"
           # Invoke via `bash` so the checked-out .sh does not need the +x execute bit
           # (git on Windows / robocopy mirror doesn't carry the mode → exit 126 otherwise).
           bash ./scripts/gen-deployment-settings.sh \
             ./deploymentSettings.skeleton.json \
             bindings.json \
-            DeploymentSettings.json
+            DeploymentSettings.json \
+            "./config/env-vars.${ENVKEY}.json"
           cat DeploymentSettings.json
 
       - name: Upload patched artifact + settings
