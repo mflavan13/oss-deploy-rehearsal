@@ -150,11 +150,16 @@ jobs:
           fi
           # Authenticate the bundled pac CLI as the DEPLOY SP against the TARGET env (same identity
           # the import runs under) — the check must see exactly what the SP can see.
+          # --accept-cleartext-caching: the headless Linux runner has no libsecret keyring, so pac
+          # can't cache the SP secret to refresh tokens for later calls — `pac connection list` then
+          # fails with AuthProfileSpnSecretNotFoundWithLinuxFallback. Cleartext caching on the
+          # ephemeral runner is fine (the secret is already a GitHub Actions secret).
           pac auth create \
             --applicationId "$PP_APP_ID" \
             --clientSecret  "$PP_CLIENT_SECRET" \
             --tenant        "$PP_TENANT_ID" \
-            --environment   "$TARGET_URL"
+            --environment   "$TARGET_URL" \
+            --accept-cleartext-caching
 
           # Every ConnectionId the app bound into DeploymentSettings.json. Blank refs already failed
           # the job at generation time (gen-deployment-settings.sh); assert the non-blank ones resolve.
