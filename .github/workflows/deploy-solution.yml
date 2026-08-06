@@ -140,6 +140,14 @@ jobs:
           TARGET_URL:       ${{ github.event.client_payload.targetEnvUrl }}
         run: |
           set -euo pipefail
+          # actions-install placed the pac CLI under POWERPLATFORMTOOLS_PACPATH but did NOT add it to
+          # PATH for a custom run step (a `uses:` PP action finds it internally; a bare `pac` here does
+          # not → "pac: command not found", exit 127). Locate the pac binary and prepend its dir.
+          if ! command -v pac >/dev/null 2>&1; then
+            PAC_BIN="$(find "${POWERPLATFORMTOOLS_PACPATH:-/tmp}" -type f -name pac 2>/dev/null | head -1 || true)"
+            [ -n "$PAC_BIN" ] || { echo "::error::OI-5: pac CLI not found under POWERPLATFORMTOOLS_PACPATH (${POWERPLATFORMTOOLS_PACPATH:-unset})"; exit 1; }
+            export PATH="$(dirname "$PAC_BIN"):$PATH"
+          fi
           # Authenticate the bundled pac CLI as the DEPLOY SP against the TARGET env (same identity
           # the import runs under) — the check must see exactly what the SP can see.
           pac auth create \
