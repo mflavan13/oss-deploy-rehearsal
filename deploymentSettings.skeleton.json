@@ -1,24 +1,5 @@
 {
-  "_comment": "Spike 007 · committed per-solution SKELETON. First-party ConnectionReferences carry a static LogicalName + ConnectorId; ConnectionId is left blank and injected per-target from the app's client_payload.bindings by gen-deployment-settings.sh. Custom-connector refs (see the last entry) carry an env-specific ConnectorId that the binding overrides per target. EnvironmentVariables are the solution's per-env config (separate from GitHub Actions variables).",
-  "EnvironmentVariables": [
-    { "SchemaName": "oss_ApiBaseUrl", "Value": "" }
-  ],
-  "ConnectionReferences": [
-    {
-      "LogicalName": "oss_sharedsql_abc12",
-      "ConnectionId": "",
-      "ConnectorId": "/providers/Microsoft.PowerApps/apis/shared_sql"
-    },
-    {
-      "LogicalName": "oss_sharedoffice365_def34",
-      "ConnectionId": "",
-      "ConnectorId": "/providers/Microsoft.PowerApps/apis/shared_office365"
-    },
-    {
-      "_comment": "custom-connector ref: ConnectorId is env-specific (shared_<uniquename>-<suffix>) and LogicalName is hashed — the binding supplies BOTH per target; cert-auth connections bind identically by ConnectionId (pre-provisioned out-of-band).",
-      "LogicalName": "oss_sharedmycustomapi_ghi56",
-      "ConnectionId": "",
-      "ConnectorId": "/providers/Microsoft.PowerApps/apis/shared_mycustomapi-5f9a1b"
-    }
-  ]
+  "_comment": "Spike 007 · committed per-solution SKELETON. BINDINGS-DRIVEN design: ConnectionReferences are built by gen-deployment-settings.sh from the app's client_payload.bindings (the running app is the source of truth for which refs exist and their per-env ConnectionId + ConnectorId) — NOT from this file. ConnectionReferences here is therefore empty and unused. The skeleton's ONLY remaining role is EnvironmentVariables (the solution's per-env config, populated per-target by wave 19-09); T8Probe has none, so it is empty for now. EnvironmentVariables are separate from GitHub Actions variables.",
+  "EnvironmentVariables": [],
+  "ConnectionReferences": []
 }
