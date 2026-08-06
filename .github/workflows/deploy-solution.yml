@@ -19,9 +19,10 @@
 # backstop. Per-env target URLs come from per-env-named repo secrets
 # PP_URL_DEV / PP_URL_QA / PP_URL_STAGE / PP_URL_PROD selected by stageKey (D-21)
 # — NEVER from the payload. Stage keys are TOP-anchored per lane (19-11): a lane's
-# highest-ranked env is ALWAYS 'prod', so the D-18 reviewer gate (added on the
-# 'prod' Environment by 19-10) is structurally unskippable; dev→qa→stage
-# auto-promote ungated.
+# highest-ranked env is ALWAYS 'prod', so the D-18 reviewer gate (19-10: required
+# reviewers + prevent-self-review, configured SERVER-SIDE on the 'prod' GitHub
+# Environment — never an app/workflow check) is structurally unskippable;
+# dev→qa→stage auto-promote ungated.
 #
 # ⚠ THE FOUR import-* JOBS ARE DELIBERATE STATIC COPIES (D-15 — GitHub has no
 # runtime job generation). They MUST stay in lockstep: edit all four together.
@@ -140,8 +141,9 @@ jobs:
   # ── 19-08 hop anatomy (applies to ALL FOUR import-* jobs below) ─────────────────
   #
   # environment: <stageKey>   — static GitHub Environment named by stage key. GitHub
-  #   auto-creates it on first reference; 19-10 puts required reviewers + prevent-self-
-  #   review on 'prod' ONLY (D-18). The pre-19-08 URL-named Environment is retired.
+  #   auto-creates it on first reference; the D-18 gate (required reviewers ≥1 +
+  #   prevent-self-review, 19-10) lives on 'prod' ONLY, configured server-side in the
+  #   Environment's protection rules. The pre-19-08 URL-named Environment is retired.
   # needs: [build-artifact, import-<prev>] — rank-order chaining; hop N+1 starts only
   #   after hop N resolves. The `if` guard (see header) lets a skipped out-of-chain
   #   predecessor pass while a failed in-chain predecessor stops everything downstream.
@@ -593,7 +595,7 @@ jobs:
   import-prod:
     needs: [build-artifact, import-stage]
     runs-on: ubuntu-latest
-    environment: prod                # 19-10 adds required reviewers + prevent-self-review HERE only (D-18)
+    environment: prod                # D-18 gate (19-10): required reviewers + prevent-self-review pause THIS job only — server-enforced by the Environment's protection rules, no app-side approval check
     if: ${{ !failure() && !cancelled() && contains(github.event.client_payload.chain.*.stageKey, 'prod') }}
     steps:
       - name: Checkout the deploy repo (scripts + skeleton + per-target env-var config — D-12)
