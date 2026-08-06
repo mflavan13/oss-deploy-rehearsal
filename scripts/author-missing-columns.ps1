@@ -92,11 +92,37 @@ $specs = @(
   @{ e='oss_reviewchecklistitem';   a='oss_ischecked';   kind='bit' }
 )
 
+# ---- restrict to the spec entities actually present in THIS export ----
+# A solution may legitimately contain SOME or NONE of the wedge-scarred entities
+# (e.g. a connection-reference-only solution like T8Probe has no tables at all).
+# Author only the columns whose owning entity is present in the export; a solution
+# with none of them is a clean pass-through. This closes the null-method-call bug the
+# live 19-05 e2e surfaced on a table-less deploy ($prodEnt was null at template extraction).
+$applicableSpecs = @($specs | Where-Object {
+  $e = $_.e
+  @($x.SelectNodes('//Entities/Entity') | Where-Object { $_.Name.InnerText -ieq $e }).Count -gt 0
+})
+
+# ---- PASS-THROUGH GUARD: no wedge-scarred entities -> nothing to author ----
+# Runs BEFORE the FROM_MODEL resolution and the template extraction (which assume
+# oss_product / oss_reviewchecklistitem exist), so the null never happens.
+if ($applicableSpecs.Count -eq 0) {
+  "AUTHORED: 0 (no wedge-scarred entities in this solution — pass-through)"
+  if ($extractRoot -and -not $WhatIf) {
+    if (-not $OutZip) { throw '-SolutionZip requires -OutZip.' }
+    if (Test-Path $OutZip) { Remove-Item $OutZip -Force }
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    [System.IO.Compression.ZipFile]::CreateFromDirectory($extractRoot, $OutZip)
+    "REZIPPED: $OutZip"
+  }
+  exit 0
+}
+
 # ---- resolve FROM_MODEL specs by parsing the generated model constant blocks ----
 # $ModelsDir is now a param (repo-relative default). Keep it pointed at the generated
 # model dir - those *Model.ts constant blocks are the runtime value->label source of truth.
 $modelsDir = $ModelsDir
-foreach ($s in $specs) {
+foreach ($s in $applicableSpecs) {
   if ($s.opts -is [string] -and $s.opts -like 'FROM_MODEL:*') {
     $parts = $s.opts -split ':'
     $file = "$modelsDir/$($parts[1]).ts"
@@ -153,9 +179,10 @@ function New-AttributeNode($doc, $template, $entityLogical, $attrLogical, $kind,
 }
 
 $added = 0
-foreach ($s in $specs) {
+foreach ($s in $applicableSpecs) {
   $ent = $x.SelectNodes('//Entities/Entity') | Where-Object { $_.Name.InnerText -ieq $s.e }
-  if (-not $ent) { throw "Entity $($s.e) not in export" }
+  # $s.e is guaranteed present ($applicableSpecs is filtered to entities in this export),
+  # so $ent is never null here — the old 'throw "Entity ... not in export"' is unreachable.
   $attrsParent = $ent.SelectSingleNode('.//attributes')
   $exists = $attrsParent.SelectNodes('./attribute') | Where-Object { $_.SelectSingleNode('./LogicalName').InnerText -eq $s.a }
   if ($exists) { "SKIP (already present): $($s.e).$($s.a)"; continue }
@@ -180,8 +207,9 @@ foreach ($opt in $v.SelectNodes('//option')) {
   if (-not $lbl -or [string]::IsNullOrWhiteSpace($lbl.GetAttribute('description'))) { $badLabels++ }
 }
 "LABEL-LESS OPTIONS AFTER AUTHORING: $badLabels"
-foreach ($s in $specs) {
+foreach ($s in $applicableSpecs) {
   $ent = $v.SelectNodes('//Entities/Entity') | Where-Object { $_.Name.InnerText -ieq $s.e }
+  if (-not $ent) { "STILL MISSING: $($s.e).$($s.a)"; continue }  # defensive: never fires for a full solution
   $hit = $ent.SelectNodes('.//attributes/attribute') | Where-Object { $_.SelectSingleNode('./LogicalName').InnerText -eq $s.a }
   if (-not $hit) { "STILL MISSING: $($s.e).$($s.a)" }
 }
