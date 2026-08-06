@@ -96,7 +96,9 @@ jobs:
       - name: Generate deploymentSettings.json (skeleton ⊕ app bindings)   # T7
         run: |
           echo '${{ toJSON(github.event.client_payload.bindings) }}' > bindings.json
-          ./scripts/gen-deployment-settings.sh \
+          # Invoke via `bash` so the checked-out .sh does not need the +x execute bit
+          # (git on Windows / robocopy mirror doesn't carry the mode → exit 126 otherwise).
+          bash ./scripts/gen-deployment-settings.sh \
             ./deploymentSettings.skeleton.json \
             bindings.json \
             DeploymentSettings.json
