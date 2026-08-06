@@ -70,24 +70,49 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Show what the app sent + assert the chain contract
+        # CR-01 (19-12): every shell-consumed payload field crosses via env: — the value
+        # lands in the process ENVIRONMENT, not the script text, so a quote / $() /
+        # backtick in a crafted value is inert data and cannot break out of quoting.
+        env:
+          CORRELATION_ID: ${{ github.event.client_payload.correlationId }}
+          CHAIN_JSON: ${{ toJSON(github.event.client_payload.chain) }}
+          BINDINGS_JSON: ${{ toJSON(github.event.client_payload.bindings) }}
         run: |
-          echo "correlationId = ${{ github.event.client_payload.correlationId }}"
+          echo "correlationId = $CORRELATION_ID"
           echo "chain (ordered, rank order — element order IS job order):"
-          echo '${{ toJSON(github.event.client_payload.chain) }}'
+          printf '%s' "$CHAIN_JSON" > chain.json
+          cat chain.json; echo
           echo "bindings (raw JSON, per-hop-tagged):"
-          echo '${{ toJSON(github.event.client_payload.bindings) }}'
-          test -n "${{ github.event.client_payload.correlationId }}" || (echo "::error::no correlationId" && exit 1)
-          # T-19-43 backstop: an absent/empty chain would skip EVERY import job and the
-          # run would read green having deployed NOTHING. The app already refuses to fire
-          # an empty chain pre-dispatch (19-11); refuse it server-side too.
-          echo '${{ toJSON(github.event.client_payload.chain) }}' \
-            | jq -e 'type == "array" and length > 0' > /dev/null \
-            || (echo "::error::client_payload.chain missing or empty — refusing a deploy that would execute no stages" && exit 1)
+          printf '%s' "$BINDINGS_JSON" > bindings-all.json
+          cat bindings-all.json; echo
+          test -n "$CORRELATION_ID" || (echo "::error::no correlationId" && exit 1)
+          # T-19-43 backstop (WR-02, 19-12): an absent/empty chain — or one whose stageKeys
+          # never match a runnable import job — would skip EVERY import job and the run
+          # would read green having deployed NOTHING. The app already refuses to fire an
+          # empty chain pre-dispatch (19-11); refuse both cases server-side too. The
+          # array-type guard keeps a non-array/null chain failing cleanly here, not on .[].
+          printf '%s' "$CHAIN_JSON" | jq -e '(type == "array") and (length > 0) and (any(.[].stageKey; . as $s | ["dev","qa","stage","prod"] | index($s)))' > /dev/null || (echo "::error::chain contains no runnable stage — refusing a deploy that would execute no import job" && exit 1)
 
   build-artifact:
     needs: echo-payload
     runs-on: ubuntu-latest       # Linux: forward-slash zip entry names (required by the zip-patch)
     steps:
+      # WR-05 (19-12): the source env/solution remain payload-supplied but are now
+      # format-gated (fail-loud, BEFORE the export AND the zip-patch) + env-routed;
+      # resolving the source from a secret/config by key is the 18.x hardening follow-up.
+      - name: Validate source export inputs (WR-05)
+        shell: bash
+        env:
+          SOURCE_ENV_URL: ${{ github.event.client_payload.sourceEnvUrl }}
+          SOURCE_SOLUTION: ${{ github.event.client_payload.sourceSolution }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$SOURCE_ENV_URL" | grep -Eq '^https://[a-zA-Z0-9-]+\.crm[0-9]*\.dynamics\.com/?$' \
+            || (echo "::error::sourceEnvUrl does not match the expected Dynamics org URL shape (https://<org>.crm<N>.dynamics.com) — refusing the export" && exit 1)
+          printf '%s' "$SOURCE_SOLUTION" | grep -Eq '^[A-Za-z0-9_]+$' \
+            || (echo "::error::sourceSolution does not match the safe solution unique-name shape ([A-Za-z0-9_]+) — refusing the export" && exit 1)
+          echo "WR-05 gate OK: source export inputs are format-valid"
+
       - name: Checkout the deploy repo (self-contained for the rehearsal — D-12)
         # Plain DEFAULT checkout of THIS repo (oss-deploy-rehearsal) at the triggering commit —
         # no `ref:`, no app-repo dependency. This provides ./scripts/*, ./deploymentSettings.skeleton.json,
@@ -120,13 +145,19 @@ jobs:
 
       - name: ⚠ MANDATORY zip-patch (optionset export poisoning 0x8009050c)
         shell: pwsh
+        # CR-01 (19-12): sourceSolution is env-routed — ${env:SOURCE_SOLUTION} reads the
+        # process environment (the braces delimit the name so .zip stays literal); payload
+        # text never enters the pwsh script, so a backtick/quote in the value is inert.
+        # (The value is already format-gated by the WR-05 step above.)
+        env:
+          SOURCE_SOLUTION: ${{ github.event.client_payload.sourceSolution }}
         run: |
           # export -> PATCH -> import. The proven, PARAMETERIZED port script (Phase 18 T9 / D-14 —
           # byte-identical + idempotent, promoted to ./scripts/author-missing-columns.ps1 here)
           # extracts the exported solution zip, authors the dropped optionset/bit columns from
           # src/generated/models/*Model.ts, and re-zips (forward-slash entries). A re-run authors 0.
           ./scripts/author-missing-columns.ps1 `
-            -SolutionZip "out/${{ github.event.client_payload.sourceSolution }}.zip" `
+            -SolutionZip "out/${env:SOURCE_SOLUTION}.zip" `
             -ModelsDir   "models" `
             -OutZip      "out/patched.zip"
 
@@ -192,6 +223,8 @@ jobs:
         env:
           STAGE_KEY: dev
           TARGET_URL: ${{ secrets.PP_URL_DEV }}
+          CHAIN_JSON: ${{ toJSON(github.event.client_payload.chain) }}
+          BINDINGS_JSON: ${{ toJSON(github.event.client_payload.bindings) }}
         run: |
           set -euo pipefail
           SECRET_NAME="PP_URL_$(echo "$STAGE_KEY" | tr '[:lower:]' '[:upper:]')"
@@ -200,8 +233,8 @@ jobs:
             echo "::error::secret $SECRET_NAME is not configured but stage '$STAGE_KEY' is in the derived chain — add the repo secret (owner action) before dispatching a chain that traverses this stage"
             exit 1
           fi
-          echo '${{ toJSON(github.event.client_payload.chain) }}' > chain.json
-          echo '${{ toJSON(github.event.client_payload.bindings) }}' > bindings-all.json
+          printf '%s' "$CHAIN_JSON" > chain.json
+          printf '%s' "$BINDINGS_JSON" > bindings-all.json
 
           # This hop's target env GUID from the ordered chain. 19-06 deliberately KEEPS
           # GUID-less intermediate stages in the chain so the workflow fails LOUDLY here
@@ -332,6 +365,8 @@ jobs:
         env:
           STAGE_KEY: qa
           TARGET_URL: ${{ secrets.PP_URL_QA }}
+          CHAIN_JSON: ${{ toJSON(github.event.client_payload.chain) }}
+          BINDINGS_JSON: ${{ toJSON(github.event.client_payload.bindings) }}
         run: |
           set -euo pipefail
           SECRET_NAME="PP_URL_$(echo "$STAGE_KEY" | tr '[:lower:]' '[:upper:]')"
@@ -340,8 +375,8 @@ jobs:
             echo "::error::secret $SECRET_NAME is not configured but stage '$STAGE_KEY' is in the derived chain — add the repo secret (owner action) before dispatching a chain that traverses this stage"
             exit 1
           fi
-          echo '${{ toJSON(github.event.client_payload.chain) }}' > chain.json
-          echo '${{ toJSON(github.event.client_payload.bindings) }}' > bindings-all.json
+          printf '%s' "$CHAIN_JSON" > chain.json
+          printf '%s' "$BINDINGS_JSON" > bindings-all.json
 
           # This hop's target env GUID from the ordered chain. 19-06 deliberately KEEPS
           # GUID-less intermediate stages in the chain so the workflow fails LOUDLY here
@@ -472,6 +507,8 @@ jobs:
         env:
           STAGE_KEY: stage
           TARGET_URL: ${{ secrets.PP_URL_STAGE }}
+          CHAIN_JSON: ${{ toJSON(github.event.client_payload.chain) }}
+          BINDINGS_JSON: ${{ toJSON(github.event.client_payload.bindings) }}
         run: |
           set -euo pipefail
           SECRET_NAME="PP_URL_$(echo "$STAGE_KEY" | tr '[:lower:]' '[:upper:]')"
@@ -480,8 +517,8 @@ jobs:
             echo "::error::secret $SECRET_NAME is not configured but stage '$STAGE_KEY' is in the derived chain — add the repo secret (owner action) before dispatching a chain that traverses this stage"
             exit 1
           fi
-          echo '${{ toJSON(github.event.client_payload.chain) }}' > chain.json
-          echo '${{ toJSON(github.event.client_payload.bindings) }}' > bindings-all.json
+          printf '%s' "$CHAIN_JSON" > chain.json
+          printf '%s' "$BINDINGS_JSON" > bindings-all.json
 
           # This hop's target env GUID from the ordered chain. 19-06 deliberately KEEPS
           # GUID-less intermediate stages in the chain so the workflow fails LOUDLY here
@@ -612,6 +649,8 @@ jobs:
         env:
           STAGE_KEY: prod
           TARGET_URL: ${{ secrets.PP_URL_PROD }}
+          CHAIN_JSON: ${{ toJSON(github.event.client_payload.chain) }}
+          BINDINGS_JSON: ${{ toJSON(github.event.client_payload.bindings) }}
         run: |
           set -euo pipefail
           SECRET_NAME="PP_URL_$(echo "$STAGE_KEY" | tr '[:lower:]' '[:upper:]')"
@@ -620,8 +659,8 @@ jobs:
             echo "::error::secret $SECRET_NAME is not configured but stage '$STAGE_KEY' is in the derived chain — add the repo secret (owner action) before dispatching a chain that traverses this stage"
             exit 1
           fi
-          echo '${{ toJSON(github.event.client_payload.chain) }}' > chain.json
-          echo '${{ toJSON(github.event.client_payload.bindings) }}' > bindings-all.json
+          printf '%s' "$CHAIN_JSON" > chain.json
+          printf '%s' "$BINDINGS_JSON" > bindings-all.json
 
           # This hop's target env GUID from the ordered chain. 19-06 deliberately KEEPS
           # GUID-less intermediate stages in the chain so the workflow fails LOUDLY here
